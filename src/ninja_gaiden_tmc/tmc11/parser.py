@@ -1,146 +1,106 @@
-# NINJA GAIDEN SIGMA 2 TMC Importer by Nozomi Miyamori is under the public domain
-# and also marked with CC0 1.0. This file is a part of NINJA GAIDEN SIGMA 2 TMC Importer.
+# Ninja Gaiden Sigma 2 TMC Importer by Nozomi Miyamori is under the public domain
+# and also marked with CC0 1.0. This file is a part of Ninja Gaiden Sigma 2 TMC Importer.
 
 from __future__ import annotations
 #from . import sdp1
 from typing import NamedTuple
-from operator import indexOf
 from enum import IntEnum
+from operator import indexOf
+import struct
 
 class ContainerParser:
-    metadata: memoryview
-    _metadata: memoryview
-    sub_container: memoryview
-    _sub_container: memoryview
-    chunks: tuple[memoryview]
-    _chunks: tuple[memoryview]
-
     def __init__(self, magic, data, ldata = b''):
-        data = memoryview(data)
-        ldata = memoryview(ldata)
+        data = memoryview(data).toreadonly()
+        ldata = memoryview(ldata).toreadonly()
 
-        if (x := bytes(data[0:8])) != magic.ljust(8, b'\x00'):
-            raise ValueError('data has wrong magic bytes'
-                             f' ("{x.decode()}" != "{magic.decode()}").')
+        (
+                magic_, version, metadata_pos,
+                container_nbytes, chunk_count, valid_chunk_count,
+                offset_table_pos, size_table_pos, sub_container_pos,
+        ) = struct.unpack_from('< 8sII III4x III', data)
 
-        if (x := int.from_bytes(data[0x8:0xc])) != 0x0000_0101:
-            raise ValueError(f'not supported verison "{x:04X}"')
-        head_size = int.from_bytes(data[0xc:0x10], 'little')
-        container_size = int.from_bytes(data[0x10:0x14], 'little')
+        magic0 = magic.ljust(8, b'\0')
+        if magic_ != magic0:
+            raise ValueError(f'unexpected magic bytes {magic_} (expected: {magic0}).')
+        if version != 0x0101_0000:
+            raise ValueError(f'unexpected verison {version:08x} (expected: 01010000')
+        self._data = data[:container_nbytes]
 
-        data = data[:container_size].toreadonly()
-
-        chunk_count = int.from_bytes(data[0x14:0x18], 'little')
-        # valid_chunk_count = int.from_bytes(data[0x18:0x1c], 'little')
-        chunk_ofs_table_ofs = int.from_bytes(data[0x20:0x24], 'little')
-        chunk_size_table_ofs = int.from_bytes(data[0x24:0x28], 'little')
-        sub_container_ofs =  int.from_bytes(data[0x28:0x2c], 'little')
-
-        lcontainer_size = None
-        are_chunks_in_L = head_size == 0x50
-        if are_chunks_in_L:
-            f = lambda x1, x2: (int.from_bytes(x1, 'little'), int.from_bytes(x2, 'little'))
+        lcontainer_nbytes = 0
+        if metadata_pos == 0x50:
             if not ldata:
                 raise ValueError(f'{magic.decode()} should have ldata, but no ldata was passed.')
-            elif (x1 := data[0x40:0x44]) != (x2 := ldata[0x0:0x4]):
-                x1, x2 = f(x1, x2)
-                raise ValueError(f'{magic.decode()} chunk count of ldata read from data differs'
-                                 f'from chunk count read from ldata ({x1} != {x2})')
-            elif (x1 := data[0x44:0x48]) != (x2 := ldata[0x4:0x8]):
-                x1, x2 = f(x1, x2)
-                raise ValueError(f'{magic.decode()} size of ldata read from data differs from size'
-                                 f'read from ldata ({x1} != {x2})')
-            elif (x1 := data[0x48:0x4c]) != (x2 := ldata[0x8:0xc]):
-                x1, x2 = f(x1, x2)
-                raise ValueError(f'{magic.decode()} check digits read from data differs from check'
-                                 f'digits read from ldata ({x1:08X} != {x2:08X})')
-            lcontainer_size = int.from_bytes(ldata[0x4:0x8], 'little')
-        ldata = ldata[:lcontainer_size].toreadonly()
+            lhead = (_, lcontainer_nbytes, _) = struct.unpack_from('< III', data, 0x40)
+            lhead_ = struct.unpack_from('< III', ldata)
+            if lhead_ != lhead:
+                raise ValueError(f'mismatch between {magic.decode()}\'s Lhead in TMC and the one in TMCL: {lhead} != {lhead_}')
+        self._ldata = ldata[:lcontainer_nbytes]
 
-        o1 = chunk_ofs_table_ofs
-        o2 = bool(o1) * (o1 + 4*chunk_count)
-        chunk_ofs_table = data[o1:o2].cast('I')
+        o = metadata_pos
+        p = ( offset_table_pos or size_table_pos or sub_container_pos or container_nbytes )
+        self.metadata = self._metadata = data[o:p]
 
-        o1 = chunk_size_table_ofs
-        o2 = bool(o1) * (o1 + 4*chunk_count)
-        chunk_size_table = data[o1:o2].cast('I')
+        o = offset_table_pos
+        p = o + 4*chunk_count*(o > 0)
+        offset_table = data[o:p].cast('I')
 
-        o1 = head_size
-        o2 = ( chunk_ofs_table_ofs
-               or chunk_size_table_ofs
-               or sub_container_ofs
-               or container_size )
-        self._metadata = data[o1:o2]
-        self.metadata = self._metadata
-        
-        o1 = sub_container_ofs
-        o2 = bool(o1) * ( chunk_ofs_table
-                          and chunk_ofs_table[0]
-                          or container_size )
-        self._sub_container = data[o1:o2]
-        self.sub_container = self._sub_container
+        o = size_table_pos
+        p = o + 4*chunk_count*(o > 0)
+        size_table = data[o:p].cast('I')
 
-        D = (are_chunks_in_L and ldata) or data
-        O = chunk_ofs_table
-        S = chunk_size_table
-        self._chunks = tuple(ContainerParser._gen_chunks(D, O, S))
-        self.chunks = self._chunks
+        o = sub_container_pos
+        p = ( offset_table and offset_table[0] or container_nbytes )*(o > 0)
+        self.sub_container = self._sub_container = data[o:p]
+
+        self.chunks = self._chunks = tuple(ContainerParser._gen_chunks(
+            self._ldata or self._data, offset_table, size_table
+        ))
 
     @staticmethod
-    def _gen_chunks(data, chunk_ofs_table, chunk_size_table):
-        O = chunk_ofs_table
-        S = chunk_size_table
-        if S:
-            # Some chunks are empty
-            yield from ( data[o:(o+s)*bool(s)] for o, s in zip(O, S) )
+    def _gen_chunks(data, offset_table, size_table):
+        if size_table:
+            yield from ( data[o:o+n] for o, n in zip(offset_table, size_table) )
             return
 
-        for i, o1 in enumerate(O):
-            if not o1:
+        for i, o in enumerate(offset_table):
+            if not o:
                 yield data[:0]
                 continue
-            for o2 in O[i+1:]:
-                if o2:
-                    yield data[o1:o2]
+            for p in offset_table[i+1:]:
+                if p:
+                    yield data[o:p]
                     break
             else:
-                yield data[o1:]
+                yield data[o:]
+
+    def close(self):
+        for c in self._chunks:
+            c.release()
+        self._sub_container.release()
+        self._metadata.release()
+        self._ldata.release()
+        self._data.release()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
 class TMCParser(ContainerParser):
-    mdlgeo: MdlGeoParser | None = None
-    ttdm: TTDMParser | None = None
-    vtxlay: VtxLayParser | None = None
-    idxlay: IdxLayParser | None = None
-    mtrcol: MtrColParser | None = None
-    mdlinfo: MdlInfoParser | None = None
-    hielay: HieLayParser | None = None
-    lheader: LHeaderParser
-    nodelay: NodeLayParser | None = None
-    glblmtx: GlblMtxParser | None = None
-    bnofsmtx: BnOfsMtxParser | None = None
-    cpf: cpfParser | None = None
-    mcapack: MCAPACKParser | None = None
-    renpack: RENPACKParser | None = None
-    collide: memoryview | None = None
-    mtrlchng: memoryview | None = None
-    effcnf: memoryview | None = None
-    acscls: memoryview | None = None
-    #epm1: sdp1.EPM1Parser | None = None
-
     def __init__(self, data, ldata):
         super().__init__(b'TMC', data)
         
-        name = bytes(self.metadata[0x20:0x30]).partition(b'\x00')[0]
+        name,*_ = self._metadata[0x20:0x30].tobytes().partition(b'\0')
         self.metadata = TMCMetaData(name)
 
-        o1 = 0xc0
-        o2 = 0xc0 + 4*len(self._chunks)
-
-        chunk_type_id_table = self._metadata[o1:o2].cast('I')
-        i = indexOf(chunk_type_id_table, 0x8000_0020)
+        o = 0xc0
+        p = o+4*len(self._chunks)
+        tbl = self._metadata[o:p].cast('I')
+        i = indexOf(tbl, 0x8000_0020)
         self.lheader = LHeaderParser(self._chunks[i], ldata)
 
-        for t, c in zip(chunk_type_id_table, self._chunks):
+        for t, c in zip(tbl, self._chunks):
             match t:
                 case 0x4:
                     self.collide = c
@@ -151,160 +111,150 @@ class TMCParser(ContainerParser):
                 case 0x9:
                     self.acscls = c
                 case 0x45_50_4d_31:
-                    # EPM1
-                    #self.epm1 = c and sdp1.EPM1Parser(c) or None
-                    pass
+                    self.epm1 = c
                 case 0x8000_0001:
-                    self.mdlgeo = c and MdlGeoParser(c, self.lheader.mdlgeo) or None
+                    self.mdlgeo = c and MdlGeoParser(c, getattr(self.lheader, 'mdlgeo', b''))
                 case 0x8000_0002:
-                    self.ttdm = c and TTDMParser(c, self.lheader.ttdm) or None
+                    self.ttdm = c and TTDMParser(c, getattr(self.lheader, 'ttdl', b''))
                 case 0x8000_0003:
-                    self.vtxlay = c and VtxLayParser(c, self.lheader.vtxlay) or None
+                    self.vtxlay = c and VtxLayParser(c, getattr(self.lheader, 'vtxlay', b''))
                 case 0x8000_0004:
-                    self.idxlay = c and IdxLayParser(c, self.lheader.idxlay) or None
+                    self.idxlay = c and IdxLayParser(c, getattr(self.lheader, 'idxlay', b''))
                 case 0x8000_0005:
-                    self.mtrcol = c and MtrColParser(c, self.lheader.mtrcol) or None
+                    self.mtrcol = c and MtrColParser(c, getattr(self.lheader, 'mtrcol', b''))
                 case 0x8000_0006:
-                    self.mdlinfo = c and MdlInfoParser(c, self.lheader.mdlinfo) or None
+                    self.mdlinfo = c and MdlInfoParser(c, getattr(self.lheader, 'mdlinfo', b''))
                 case 0x8000_0010:
-                    self.hielay = c and HieLayParser(c, self.lheader.hielay) or None
+                    self.hielay = c and HieLayParser(c, getattr(self.lheader, 'hielay', b''))
                 case 0x8000_0030:
-                    self.nodelay = c and NodeLayParser(c, self.lheader.nodelay) or None
+                    self.nodelay = c and NodeLayParser(c, getattr(self.lheader, 'nodelay', b''))
                 case 0x8000_0040:
-                    self.glblmtx = c and GlblMtxParser(c, self.lheader.glblmtx) or None
+                    self.glblmtx = c and GlblMtxParser(c, getattr(self.lheader, 'glblmtx', b''))
                 case 0x8000_0050:
-                    self.bnofsmtx = c and BnOfsMtxParser(c, self.lheader.bnofsmtx) or None
+                    self.bnofsmtx = c and BnOfsMtxParser(c, getattr(self.lheader, 'bnofsmtx', b''))
                 case 0x8000_0060:
-                    self.cpf = c and cpfParser(c) or None
+                    self.cpf = c and cpfParser(c)
                 case 0x8000_0070:
-                    self.mcapack = c and MCAPACKParser(c) or None
+                    self.mcapack = c and MCAPACKParser(c)
                 case 0x8000_0080:
-                    self.renpack = c and RENPACKParser(c) or None
+                    self.renpack = c and RENPACKParser(c)
+
+    def close(self):
+        super().close()
+        self.lheader.close()
+        (x := getattr(self, 'mdlgeo', None)) and x.close()
+        (x := getattr(self, 'ttdm', None)) and x.close()
+        (x := getattr(self, 'vtxlay', None)) and x.close()
+        (x := getattr(self, 'idxlay', None)) and x.close()
+        (x := getattr(self, 'mtrcol', None)) and x.close()
+        (x := getattr(self, 'mdlinfo', None)) and x.close()
+        (x := getattr(self, 'hielay', None)) and x.close()
+        (x := getattr(self, 'nodelay', None)) and x.close()
+        (x := getattr(self, 'glblmtx', None)) and x.close()
+        (x := getattr(self, 'bnofsmtx', None)) and x.close()
 
 class TMCMetaData(NamedTuple):
     name: bytes
 
 class MdlGeoParser(ContainerParser):
-    chunks: tuple[ObjGeoParser]
-
     def __init__(self, data, ldata = b''):
         super().__init__(b'MdlGeo', data)
         self.chunks = tuple( ObjGeoParser(c) for c in self._chunks )
 
-class ObjGeoParser(ContainerParser):
-    metadata: ObjGeoMetaData
-    sub_container: GeoDeclParser
-    chunks: tuple[ObjGeoChunk]
+    def close(self):
+        super().close()
+        for c in self.chunks:
+            c.close()
 
+class ObjGeoParser(ContainerParser):
     def __init__(self, data):
         super().__init__(b'ObjGeo', data)
-        objgeo_idx = int.from_bytes(self._metadata[0x4:0x8], 'little', signed=True)
-        name = bytes(self._metadata[0x20:]).partition(b'\x00')[0]
-        self.metadata = ObjGeoMetaData(objgeo_idx, name)
+        _, obj_index = struct.unpack_from('< Ii', self._metadata)
+        name,*_ = self._metadata[0x20:].tobytes().partition(b'\0')
+        self.metadata = ObjGeoMetaData(obj_index, name)
         self.sub_container = GeoDeclParser(self._sub_container)
         self.chunks = tuple(ObjGeoParser._gen_chunks(self._chunks))
 
     @staticmethod
     def _gen_chunks(chunks):
         for c in chunks:
-            # NINJA GAIDEN SIGMA2 has more members than DOA5LR (+16 bytes)
+            # NGS2 has more members than DOA5LR (+16 bytes)
+            chunk_idx, mtrcol_index, texture_info_count = struct.unpack_from(f'< ii4xI', c)
+            texture_info_offset_table = struct.unpack_from(f'< {texture_info_count}I', c, 0x10)
 
-            chunk_idx = int.from_bytes(c[0x0:0x4], 'little', signed=True)
-            mtrcol_index = int.from_bytes(c[0x4:0x8], 'little', signed=True)
-            texture_map_count = int.from_bytes(c[0xc:0x10], 'little')
-            texture_map_ofs_table = c[0x10:0x10+4*texture_map_count].cast('I')
+            # 0x10:0x30 and 0x50:0x60 written by the application
+            (
+                    geodecl_index,
+                    transparent1, _, transparent2, _,
 
-            # 0x20:0x40 written by the application
-
-            geodecl_index = int.from_bytes(c[0x38:0x3c], 'little')
-            transparent1 = int.from_bytes(c[0x40:0x44], 'little')
-            unknown_0x44 = int.from_bytes(c[0x44:0x48], 'little')
-            transparent2 = int.from_bytes(c[0x48:0x4c], 'little')
-            unknown_0x4c = int.from_bytes(c[0x4c:0x50], 'little')
-
-            # 0x50:0x60 written by the application
-
-            unknown_0x60 = int.from_bytes(c[0x60:0x64], 'little')
-            unknown_0x64 = int.from_bytes(c[0x64:0x68], 'little')
-            unknown_0x68 = int.from_bytes(c[0x68:0x6c], 'little')
-            unknown_0x6c = int.from_bytes(c[0x6c:0x70], 'little')
-            unknown_0x70 = int.from_bytes(c[0x70:0x74], 'little')
-            two_sided = bool(c[0x74])
-            first_index_index = int.from_bytes(c[0x78:0x7c], 'little')
-            index_count = int.from_bytes(c[0x7c:0x80], 'little')
-            first_vertex_index = int.from_bytes(c[0x80:0x84], 'little')
-            vertex_count = int.from_bytes(c[0x84:0x88], 'little')
-
-            # unknown = int.from_bytes(c[0x88:0x8c], 'little')
-            # unknown = int.from_bytes(c[0x8c:0x90], 'little')
-            # unknown = int.from_bytes(c[0x90:0x94], 'little')
-            texture_map_info = ( c[o:o+0x7c] for o in texture_map_ofs_table )
-            texture_map_info = tuple(ObjGeoParser._gen_texture_maps(texture_map_info))
-            yield ObjGeoChunk(chunk_idx, mtrcol_index,
-                              geodecl_index,
-                              transparent1, unknown_0x44, transparent2, unknown_0x4c,
-                              unknown_0x60, unknown_0x64, unknown_0x68, unknown_0x6c,
-                              unknown_0x70, two_sided, first_index_index, index_count,
-                              first_vertex_index, vertex_count, texture_map_info)
+                    _, _, _, _,
+                    _, disable_backface_cull, first_index_index, index_count,
+                    first_vertex_index, vertex_count, _, _,
+                    _
+            ) = struct.unpack_from('< I4x IIII 16x IIII IIII IIII I', c, 0x38)
+            I = ( c[o:o+0x7c] for o in texture_info_offset_table )
+            yield ObjGeoChunk(chunk_idx, mtrcol_index, geodecl_index,
+                              transparent1, transparent2, bool(disable_backface_cull),
+                              first_index_index, index_count,
+                              first_vertex_index, vertex_count,
+                              tuple(ObjGeoParser._gen_texture_info(I)))
 
     @staticmethod
-    def _gen_texture_maps(texture_map_info):
-        # NINJA GAIDEN SIGMA2 has more members than DOA5LR (+12 bytes)
-        for m in texture_map_info:
-            map_idx = int.from_bytes(m[:0x4], 'little')
-            usage = int.from_bytes(m[0x4:0x8], 'little')
-            texture_buffer_index = int.from_bytes(m[0x8:0xc], 'little')
-            tag1 = int.from_bytes(m[0x10:0x14], 'little')
-            unknown_0x14 = int.from_bytes(m[0x14:0x18], 'little')
-            # unknown_0x = m[:0x10].cast('I')
-            # unknown_0x = m[0x10:0x20].cast('f')
-            unknown_0x78 = int.from_bytes(m[0x78:0x7c], 'little')
-            yield TextureMap(map_idx, TextureMapUsage(usage), texture_buffer_index,
-                             tag1, unknown_0x14,
-                             unknown_0x78)
+    def _gen_texture_info(data):
+        # NGS2 has more members than DOA5LR (+12 bytes)
+        for d in data:
+            info_index, usage, texture_buffer_index, _, tag1 = struct.unpack_from('< IIII I', d)
+            yield TextureInfo(info_index, TextureUsage(usage), texture_buffer_index, tag1)
+
+    def close(self):
+        super().close()
+        self.sub_container.close()
 
 class ObjGeoMetaData(NamedTuple):
-    index: int
+    #unknown0x0: int
+    obj_index: int
     name: bytes
     
 class ObjGeoChunk(NamedTuple):
-    index: int
+    chunk_index: int
     mtrcol_index: int
-    geodecl_index: int
+    geodecl_chunk_index: int
     transparent1: int
-    unknown_0x44: int
+    #unknown_0x44: int
     transparent2: int
-    unknown_0x4c: int
+    #unknown_0x4c: int
 
-    unknown_0x60: int
-    unknown_0x64: int
-    unknown_0x68: int
-    unknown_0x6c: int
-    unknown_0x70: int
-    two_sided: bool
+    #unknown_0x60: int
+    #unknown_0x64: int
+    #unknown_0x68: int
+    #unknown_0x6c: int
+    #unknown_0x70: int
+    disable_backface_cull: bool
     first_index_index: int
     index_count: int
     first_vertex_index: int
     vertex_count: int
-    texture_map_info: tuple[TextureMap]
+    #unknown_0x88: int
+    #unknown_0x8c: int
+    #unknown_0x90: int
+    texture_info_table: tuple[TextureInfo]
 
-class TextureMap(NamedTuple):
-    index: int
-    usage: int
+class TextureInfo(NamedTuple):
+    info_index: int
+    usage: TextureUsage
     texture_buffer_index: int
+    #unknown_0x10: int
     tag1: int
-    unknown_0x14: int
-    unknown_0x78: int
+    #unknown_0x14: int
+    #unknown_0x78: int
 
-class TextureMapUsage(IntEnum):
+class TextureUsage(IntEnum):
     Albedo = 0
     Normal = 1
     Specular = 2
     Emission = 3
 
 class GeoDeclParser(ContainerParser):
-    chunks: tuple[GeoDeclChunk]
-
     def __init__(self, data):
         super().__init__(b'GeoDecl', data)
         self.chunks = tuple(GeoDeclParser._gen_chunks(self._chunks))
@@ -312,42 +262,38 @@ class GeoDeclParser(ContainerParser):
     @staticmethod
     def _gen_chunks(chunks):
         for c in chunks:
-            # self.unknown1 = int.from_bytes(c[0x0:0x4], 'little')
-            struct_size = int.from_bytes(c[0x4:0x8], 'little')
-            # self.unknown2 = int.from_bytes(c[0x8:0xc], 'little')
-            index_buffer_index = int.from_bytes(c[0xc:0x10], 'little', signed=True)
-            index_count = int.from_bytes(c[0x10:0x14], 'little')
-            vertex_count = int.from_bytes(c[0x14:0x18], 'little')
-            # self.unknown3 = int.from_bytes(c[0x8:0xc], 'little')
+            (
+                    _, vertex_info_offset, _, index_buffer_index,
+                    index_count, vertex_count, _
+            ) = struct.unpack_from('< IIII III', c)
 
-            o = struct_size
-            vertex_buffer_index = int.from_bytes(c[o:o+0x4], 'little', signed=True)
-            vertex_size = int.from_bytes(c[o+0x4:o+0x8], 'little', signed=True)
-            vertex_elements_count = int.from_bytes(c[o+0x8:o+0xc], 'little')
-            o1 = o + 0x18
-            o2 = o1 + 8*vertex_elements_count
-            vertex_elements = tuple(GeoDeclParser._gen_d3dvertexelement9(c[o1:o2]))
+            (
+                    vertex_buffer_index, vertex_size, vertex_elements_count
+            ) = struct.unpack_from('< III', c, vertex_info_offset)
+
+            o = vertex_info_offset + 0x18
+            E = ( c[i:i+8] for i in range(o, 8*vertex_elements_count+o, 8) )
             yield GeoDeclChunk(index_buffer_index, index_count,
                                vertex_count, vertex_buffer_index, vertex_size,
-                               vertex_elements)
+                               tuple(GeoDeclParser._gen_d3dvertexelement9(E)))
 
     @staticmethod
     def _gen_d3dvertexelement9(data):
-        for o in range(0, len(data), 8):
-            stream = int.from_bytes(data[o:o+2], 'little')
-            offset = int.from_bytes(data[o+2:o+4], 'little')
-            d3d_decl_type = D3DDECLTYPE(data[o+4])
-            method = data[o+5]
-            usage = D3DDECLUSAGE(data[o+6])
-            usage_index = data[o+7]
-            yield D3DVERTEXELEMENT9(stream, offset, d3d_decl_type,
-                                    method, usage, usage_index)
+        for d in data:
+            (stream, offset, d3d_decl_type,
+             method, usage, usage_index) = struct.unpack('< hhBBBB', d)
+            yield D3DVERTEXELEMENT9(stream, offset, D3DDECLTYPE(d3d_decl_type),
+                                    method, D3DDECLUSAGE(usage), usage_index)
 
-    
 class GeoDeclChunk(NamedTuple):
+    #unknown0x0: int # always 0
+    #unknown0x8: int # always 1
     index_buffer_index: int
     index_count: int
     vertex_count: int
+    #unknown0x18: int # 0, 1 or 3
+    # e.g. MOT* and OPTblur have 0, WGTmodel's decl1 has 1,
+    # OPTscat and WGTmodel's decl0 have 3,
     vertex_buffer_index: int
     vertex_size: int
     vertex_elements: tuple[D3DVERTEXELEMENT9]
@@ -397,17 +343,17 @@ class D3DDECLUSAGE(IntEnum):
     SAMPLE        = 13
 
 class TTDMParser(ContainerParser):
-    metadata: TTDHParser
-    sub_container: TTDLParser
-
     def __init__(self, data, ldata):
         super().__init__(b'TTDM', data)
         self.metadata = TTDHParser(self._metadata)
         self.sub_container = TTDLParser(self._sub_container, ldata)
 
-class TTDHParser(ContainerParser):
-    chunks: tuple[tuple[bool, int]]
+    def close(self):
+        super().close()
+        self.metadata.close()
+        self.sub_container.close()
 
+class TTDHParser(ContainerParser):
     def __init__(self, data):
         super().__init__(b'TTDH', data)
         self.chunks = tuple(TTDHParser._gen_chunks(self._chunks))
@@ -416,14 +362,13 @@ class TTDHParser(ContainerParser):
     def _gen_chunks(chunks):
         for c in chunks:
             # If is_in_L is true, the index points to TTDL, otherwise it points to TTDM.
-            # Although, all data seems be in TTDL when it comes to NGS2.
-            is_in_L = bool(c[0])
-            index = int.from_bytes(c[0x4:0x8], 'little', signed=True)
-            yield TTDHChunk(is_in_L, index)
+            # Although, all data seems be in TTDL when it comes to NGS2 TMC.
+            is_in_L, index = struct.unpack_from('< Ii', c)
+            yield TTDHChunk(bool(is_in_L), index)
 
 class TTDHChunk(NamedTuple):
     is_in_L: bool
-    index: int
+    chunk_index: int
 
 class TTDLParser(ContainerParser):
     def __init__(self, data, ldata):
@@ -438,10 +383,12 @@ class IdxLayParser(ContainerParser):
         super().__init__(b'IdxLay', data, ldata)
         self.chunks = tuple( c.cast('H') for c in self._chunks )
 
+    def close(self):
+        super().close()
+        for c in self.chunks:
+            c.release()
 
 class MtrColParser(ContainerParser):
-    chunks: tuple[MtrColChunk]
-
     def __init__(self, data, ldata = b''):
         super().__init__(b'MtrCol', data)
         self.chunks = tuple(MtrColParser._gen_chunks(self._chunks))
@@ -449,45 +396,41 @@ class MtrColParser(ContainerParser):
     @staticmethod
     def _gen_chunks(chunks):
         for c in chunks:
-            colors = c[0:0xd0].cast('f')
-            mtrcol_idx = int.from_bytes(c[0xd0:0xd4], 'little', signed=True)
-            xrefs_count = int.from_bytes(c[0xd4:0xd8], 'little')
-            f = lambda x1, x2: ( int.from_bytes(x1, 'little', signed=True),
-                                 int.from_bytes(x2, 'little') )
-            xrefs = tuple( f(c[o:o+4], c[o+4:o+8])
-                          for o in range(0xd8, 0xd8 + 8*xrefs_count, 8) )
+            *colors, mtrcol_idx, xrefs_count = struct.unpack_from('< 52f iI', c)
+            xrefs = struct.unpack_from('<' + xrefs_count*'iI', c, 0xd8)
+            xrefs = tuple(xrefs[i:i+2] for i in range(0, len(xrefs), 2))
             yield MtrColChunk(colors, mtrcol_idx, xrefs)
 
 class MtrColChunk(NamedTuple):
-    colors: memoryview
-    index: int
+    colors: tuple[float]
+    chunk_index: int
     # Each tuple has (objindex, count)
     # that means the mtrcol is used by "objindex" "count" times
     xrefs: tuple[tuple[int, int]]
 
 class MdlInfoParser(ContainerParser):
-    chunks: tuple[ObjInfoParser]
-
     def __init__(self, data, ldata = b''):
         super().__init__(b'MdlInfo', data)
         self.chunks = tuple( ObjInfoParser(c) for c in self._chunks )
 
-class ObjInfoParser(ContainerParser):
-    metadata: ObjInfoMetaData
+    def close(self):
+        super().close()
+        for c in self.chunks:
+            c.close()
 
+class ObjInfoParser(ContainerParser):
     def __init__(self, data):
         super().__init__(b'ObjInfo', data)
-        objinfo_idx = int.from_bytes(self._metadata[0x4:0x8], 'little', signed=True)
-        objinfo_type = int.from_bytes(self._metadata[0xc:0x10], 'little')
-        self.metadata = ObjInfoMetaData(objinfo_idx, objinfo_type)
+        _, obj_index, _ = struct.unpack_from('< Ii4xI', self._metadata)
+        self.metadata = ObjInfoMetaData(obj_index)
 
 class ObjInfoMetaData(NamedTuple):
-    index: int
-    type: int
+    #unknown0x0: int # always 0x03000200
+    obj_index: int
+    #unknown0xc: int
+    #unknown0x14: int
 
 class HieLayParser(ContainerParser):
-    chunks: tuple[HieLayChunk]
-
     def __init__(self, data, ldata = b''):
         super().__init__(b'HieLay', data)
         self.chunks = tuple(HieLayParser._gen_chunks(self._chunks))
@@ -495,32 +438,17 @@ class HieLayParser(ContainerParser):
     @staticmethod
     def _gen_chunks(chunks):
         for c in chunks:
-            matrix = tuple( c[0x0:0x40].cast('f')[i:i+4] for i in range(0,16,4) )
-            parent = int.from_bytes(c[0x40:0x44], 'little', signed=True)
-            children_count = int.from_bytes(c[0x44:0x48], 'little')
-            level = int.from_bytes(c[0x48:0x4c], 'little')
-            n = children_count
-            children = tuple(c[0x50:0x50+4*n].cast('i'))
+            *matrix, parent, children_count, level = struct.unpack_from('< 16f iII', c)
+            children = struct.unpack_from(f'< {children_count}i', c, 0x50)
             yield HieLayChunk(matrix, parent, level, children)
 
 class HieLayChunk(NamedTuple):
-    matrix: memoryview
+    matrix: tuple[float]
     parent: int
     level: int
     children: tuple[int]
 
 class LHeaderParser(ContainerParser):
-    mdlgeo: memoryview | None = None
-    ttdm: memoryview | None = None
-    vtxlay: memoryview | None = None
-    idxlay: memoryview | None = None
-    mtrcol: memoryview | None = None
-    mdlinfo: memoryview | None = None
-    hielay: memoryview | None = None
-    nodelay: memoryview | None = None
-    glblmtx: memoryview | None = None
-    bnofsmtx: memoryview | None = None
-
     def __init__(self, data, ldata):
         super().__init__(b'LHeader', data, ldata)
 
@@ -532,7 +460,7 @@ class LHeaderParser(ContainerParser):
                 case 0xC000_0001:
                     self.mdlgeo = c
                 case 0xC000_0002:
-                    self.ttdm = c
+                    self.ttdl = c
                 case 0xC000_0003:
                     self.vtxlay = c
                 case 0xC000_0004:
@@ -557,34 +485,29 @@ class LHeaderParser(ContainerParser):
                     self.renpack = c
 
 class NodeLayParser(ContainerParser):
-    chunks: tuple[NodeObjParser]
-
     def __init__(self, data, ldata = b''):
         super().__init__(b'NodeLay', data)
         self.chunks = tuple( NodeObjParser(c) for c in self._chunks )
 
-class NodeObjParser(ContainerParser):
-    metadata: NodeObjMetaData
-    chunks: tuple[NodeObjChunk]
+    def close(self):
+        super().close()
+        for c in self.chunks:
+            c.close()
 
+class NodeObjParser(ContainerParser):
     def __init__(self, data):
         super().__init__(b'NodeObj', data)
-        unknown0x0 = int.from_bytes(self._metadata[0x0:0x4], 'little')
-        master = int.from_bytes(self._metadata[0x4:0x8], 'little', signed=True)
-        node_index = int.from_bytes(self._metadata[0x8:0xc], 'little')
-        name = bytes(self._metadata[0x10:]).partition(b'\x00')[0]
-        self.metadata = NodeObjMetaData(unknown0x0, master, node_index, name)
+        _, master, node_index = struct.unpack_from('< Iii', self._metadata)
+        name,*_ = self._metadata[0x10:].tobytes().partition(b'\0')
+        self.metadata = NodeObjMetaData(master, node_index, name)
         if self._chunks:
             c = self._chunks[0]
-            obj_index = int.from_bytes(c[0x0:0x4], 'little', signed=True)
-            group_size = int.from_bytes(c[0x4:0x8], 'little', signed=True)
-            node_index = int.from_bytes(c[0x8:0xc], 'little', signed=True)
-            matrix = tuple( c[0x10:0x50].cast('f')[i:i+4] for i in range(0,16,4) )
-            node_group = tuple(c[0x50:0x50+4*group_size].cast('i'))
+            obj_index, node_count, node_index, *matrix = struct.unpack_from('< iIi4x 16f', c)
+            node_group = struct.unpack_from(f'< {node_count}i', c, 0x50)
             self.chunks = (NodeObjChunk(obj_index, node_index, matrix, node_group),)
-            
+
 class NodeObjMetaData(NamedTuple):
-    unknown0x0: int
+    #unknown0x0: int
     master: int
     node_index: int
     name: bytes
@@ -592,15 +515,15 @@ class NodeObjMetaData(NamedTuple):
 class NodeObjChunk(NamedTuple):
     obj_index: int
     node_index: int
-    matrix: memoryview
+    matrix: tuple[float]
     node_group: tuple[int]
     
 class GlblMtxParser(ContainerParser):
-    def __init__(self, data, ldata = memoryview(b'')):
+    def __init__(self, data, ldata = b''):
         super().__init__(b'GlblMtx', data)
-        self.chunks = tuple( tuple( c.cast('f')[i:i+4] for i in range(0,16,4) ) for c in self._chunks )
+        self.chunks = tuple( struct.unpack_from('< 16f', c) for c in self._chunks )
 
 class BnOfsMtxParser(ContainerParser):
-    def __init__(self, data, ldata = memoryview(b'')):
+    def __init__(self, data, ldata = b''):
         super().__init__(b'BnOfsMtx', data)
-        self.chunks = tuple( tuple( c.cast('f')[i:i+4] for i in range(0,16,4) ) for c in self._chunks )
+        self.chunks = tuple( struct.unpack_from('< 16f', c) for c in self._chunks )

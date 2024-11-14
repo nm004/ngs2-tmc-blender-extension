@@ -2,7 +2,7 @@
 # and also marked with CC0 1.0. This file is a part of NINJA GAIDEN SIGMA 2 TMC Importer.
 
 from .parser import (
-    TMCParser, TextureMapUsage, D3DDECLUSAGE, D3DDECLTYPE
+    TMCParser, TextureUsage, D3DDECLUSAGE, D3DDECLTYPE
 )
 import bpy
 import bmesh
@@ -13,6 +13,7 @@ from bpy_extras.io_utils import ImportHelper
 from bpy.props import StringProperty, CollectionProperty
 from bpy.types import Operator, OperatorFileListElement
 
+from itertools import accumulate
 import tempfile
 import struct
 import os
@@ -21,97 +22,6 @@ import mmap
 
 def import_tmc11(context, tmc):
     tmc_name = tmc.metadata.name.decode()
-
-    # We load textures
-    # TODO: Use delete_on_close=False instead of delete=False when Blender has begun to ship Python 3.12
-    images = []
-    format0 = len(str(len(tmc.ttdm.sub_container.chunks)))
-    with tempfile.NamedTemporaryFile(delete=False) as t:
-        for i,c in enumerate(tmc.ttdm.sub_container.chunks):
-            t.close()
-            with open(t.name, t.file.mode) as f:
-                f.write(c)
-            images.append(x := bpy.data.images.load(t.name))
-            x.pack()
-            x.name = str(tmc_name + f'_{i:0{format0}}')
-            x.filepath_raw = ''
-    os.remove(t.name)
-
-    # We add materials
-    materials = []
-    texmapinfo_to_matindex = {}
-    format0 = len(str(len(tmc.mtrcol.chunks)))
-    #uvnames = [ 'UVMap0', 'UVMap1', 'UVMap2', 'UVMap3' ]
-    uvnames = [ '', 'UVMap1', 'UVMap2', 'UVMap3' ]
-    for i, c in enumerate(tmc.mtrcol.chunks):
-        S = set()
-        for x in c.xrefs:
-            for oc in tmc.mdlgeo.chunks[x[0]].chunks:
-                if oc.mtrcol_index == i:
-                    S.add(oc.texture_map_info)
-
-        format1 = len(str(len(S)))
-        for i, T in enumerate(S):
-            m = bpy.data.materials.new(tmc_name + f'_{c.index:0{format0}}_{i:0{format1}}')
-            m.preview_render_type = 'FLAT'
-            m.use_nodes = True
-            materials.append(m)
-            # We assume that each texture corresponds to just a single material.
-            # The material slot 0 is for fallback.
-            texmapinfo_to_matindex[T] = len(materials)
-            pbsdf = m.node_tree.nodes["Principled BSDF"]
-            #pbsdf.inputs['Metallic'].default_value =
-            #pbsdf.inputs['IOR'].default_value =
-            base_mix = m.node_tree.nodes.new('ShaderNodeMix')
-            base_mix.data_type = 'RGBA'
-            base_mix.blend_type = 'OVERLAY'
-            m.node_tree.links.new(base_mix.outputs['Result'], pbsdf.inputs['Base Color'])
-            uv_idx = 0
-            for t in T:
-                ti = m.node_tree.nodes.new('ShaderNodeTexImage')
-                ti.image = images[t.texture_buffer_index]
-                uvn = m.node_tree.nodes.new('ShaderNodeUVMap')
-                uv_map = uvnames[uv_idx]
-                uv_idx += 1
-                uvn.uv_map = uv_map
-                m.node_tree.links.new(uvn.outputs['UV'], ti.inputs['Vector'])
-                match t.usage:
-                    case TextureMapUsage.Albedo:
-                        match t.tag1:
-                            case 0:
-                                #ti.image.colorspace_settings.name = 'Non-Color'
-                                pass
-                            case 1:
-                                m.node_tree.links.new(ti.outputs['Color'], base_mix.inputs['B'])
-                                m.node_tree.links.new(ti.outputs['Alpha'], base_mix.inputs['Factor'])
-                            case 3 | 5:
-                                if not base_mix.inputs['A'].is_linked:
-                                    m.node_tree.links.new(ti.outputs['Color'], base_mix.inputs['A'])
-                                    m.node_tree.links.new(ti.outputs['Alpha'], pbsdf.inputs['Alpha'])
-                                else:
-                                    m.node_tree.links.new(ti.outputs['Color'], base_mix.inputs['B'])
-                                    m.node_tree.links.new(ti.outputs['Alpha'], base_mix.inputs['Factor'])
-                            case x:
-                                raise ValueError(f'Not supported albedo texture format: {repr(x)}')
-                    case TextureMapUsage.Normal:
-                        ti.image.colorspace_settings.name = 'Non-Color'
-                        nml = m.node_tree.nodes.new('ShaderNodeNormalMap')
-                        nml.uv_map = uv_map
-                        curv = m.node_tree.nodes.new('ShaderNodeRGBCurve')
-                        curv_p = curv.mapping.curves[1].points
-                        curv_p[0].location = (0, 1)
-                        curv_p[1].location = (1, 0)
-                        m.node_tree.links.new(ti.outputs['Color'], curv.inputs['Color'])
-                        m.node_tree.links.new(curv.outputs['Color'], nml.inputs['Color'])
-                        m.node_tree.links.new(nml.outputs['Normal'], pbsdf.inputs['Normal'])
-                    case TextureMapUsage.Specular:
-                        m.node_tree.links.new(ti.outputs['Color'], pbsdf.inputs['Specular Tint'])
-                    case TextureMapUsage.Emission:
-                        uvn.uv_map = ''
-                        m.node_tree.links.new(ti.outputs['Color'], pbsdf.inputs['Emission Color'])
-                        m.node_tree.links.new(ti.outputs['Alpha'], pbsdf.inputs['Emission Strength'])
-                    case x:
-                        raise ValueError(f'Not supported texture map usage: {repr(x)}')
 
     # We form an armature
     a = bpy.data.armatures.new(tmc_name)
@@ -123,17 +33,16 @@ def import_tmc11(context, tmc):
     context.view_layer.objects.active = armature_obj
     bpy.ops.object.mode_set(mode='EDIT')
     for c in tmc.nodelay.chunks:
-        b = armature_obj.data.edit_bones.new(c.metadata.name.decode())
-        b.matrix = tmc.glblmtx.chunks[c.metadata.node_index]
+        gm = tmc.glblmtx.chunks[c.metadata.node_index]
+        b = a.edit_bones.new(c.metadata.name.decode())
+        b.matrix = (gm[0:4], gm[4:8], gm[8:12], gm[12:16])
     for c in tmc.nodelay.chunks:
         i = c.metadata.node_index
-        EB = armature_obj.data.edit_bones
         pi = tmc.hielay.chunks[i].parent
-        b = EB[i]
         if pi > -1:
-            b.parent = EB[pi]
+            a.edit_bones[i].parent = a.edit_bones[pi]
         else:
-            r = b
+            r = a.edit_bones[i]
     r.tail = (0, .075, 0)
     set_bone_tail(r)
     bpy.ops.object.mode_set(mode='OBJECT')
@@ -150,6 +59,126 @@ def import_tmc11(context, tmc):
     for c in a.collections.values():
         if not len(c.bones):
             a.collections.remove(c)
+
+    # We load textures
+    # TODO: Use delete_on_close=False instead of delete=False when Blender has begun to ship Python 3.12
+    images = []
+    n = len(str(len(tmc.ttdm.sub_container.chunks)))
+    with tempfile.NamedTemporaryFile(delete=False) as t:
+        for i,c in enumerate(tmc.ttdm.sub_container.chunks):
+            t.close()
+            with open(t.name, t.file.mode) as f:
+                f.write(c)
+            images.append(x := bpy.data.images.load(t.name))
+            x.pack()
+            x.name = str(tmc_name + '_' + str(i).zfill(n))
+            x.filepath_raw = ''
+    os.remove(t.name)
+
+    # We make node gourps which represents MTRCOLs
+    shader_node_groups = []
+    #uvnames = [ 'UVMap0', 'UVMap1', 'UVMap2', 'UVMap3' ]
+    uvnames = [ '', 'UVMap1', 'UVMap2', 'UVMap3' ]
+    n0 = len(str(len(tmc.mtrcol.chunks)))
+    for i, c in enumerate(tmc.mtrcol.chunks):
+        ng = bpy.data.node_groups.new(tmc_name + '_' + str(i).zfill(n0), 'ShaderNodeTree')
+        shader_node_groups.append(ng)
+        ng.interface.new_socket('Factor', socket_type='NodeSocketFloat')
+        ng.interface.new_socket('A', socket_type='NodeSocketColor')
+        ng.interface.new_socket('B', socket_type='NodeSocketColor')
+        ng.interface.new_socket('Alpha', socket_type='NodeSocketFloat')
+        ng.interface.new_socket('Normal', socket_type='NodeSocketVector')
+        ng.interface.new_socket('Specular Tint', socket_type='NodeSocketColor')
+        ng.interface.new_socket('Emission Color', socket_type='NodeSocketColor')
+        ng.interface.new_socket('Emission Strength', socket_type='NodeSocketFloat')
+        ng.interface.new_socket('BSDF', in_out='OUTPUT', socket_type='NodeSocketShader')
+        pbsdf = ng.nodes.new('ShaderNodeBsdfPrincipled')
+        base_mix = ng.nodes.new('ShaderNodeMix')
+        base_mix.data_type = 'RGBA'
+        base_mix.blend_type = 'OVERLAY'
+        ng.links.new(base_mix.outputs['Result'], pbsdf.inputs['Base Color'])
+        I = ng.nodes.new('NodeGroupInput')
+        ng.links.new(I.outputs['Factor'], base_mix.inputs['Factor'])
+        ng.links.new(I.outputs['A'], base_mix.inputs['A'])
+        ng.links.new(I.outputs['B'], base_mix.inputs['B'])
+        ng.links.new(I.outputs['Alpha'], pbsdf.inputs['Alpha'])
+        ng.links.new(I.outputs['Normal'], pbsdf.inputs['Normal'])
+        ng.links.new(I.outputs['Specular Tint'], pbsdf.inputs['Specular Tint'])
+        ng.links.new(I.outputs['Emission Color'], pbsdf.inputs['Emission Color'])
+        ng.links.new(I.outputs['Emission Strength'], pbsdf.inputs['Emission Strength'])
+        O = ng.nodes.new('NodeGroupOutput')
+        ng.links.new(pbsdf.outputs['BSDF'], O.inputs['BSDF'])
+
+    # Then, we add materials for each OBJGEO chunk
+    materials = []
+    # Material Slot 0 is for fallback
+    matindex_next = 1
+    objchunk_to_matindex = len(tmc.mdlgeo.chunks) * [ None ]
+    # We use NODEOBJs because names in OBJGEO were omitted, although NODEOBJ has a full name.
+    for c in tmc.nodelay.chunks:
+        try:
+            objgeo = tmc.mdlgeo.chunks[c.chunks[0].obj_index]
+        except IndexError:
+            continue
+        name_pre = tmc_name + '_' + c.metadata.name.decode() + '_'
+        s = matindex_next
+        matindex_next += len(objgeo.chunks)
+        objchunk_to_matindex[objgeo.metadata.obj_index] = range(s, matindex_next)
+        n = len(str(len(objgeo.chunks)))
+        for c in objgeo.chunks:
+            m = bpy.data.materials.new(name_pre + str(c.chunk_index).zfill(n))
+            materials.append(m)
+            m.preview_render_type = 'FLAT'
+            m.use_nodes = True
+            m.node_tree.nodes.remove(m.node_tree.nodes["Principled BSDF"])
+            ng = m.node_tree.nodes.new('ShaderNodeGroup')
+            ng.node_tree = shader_node_groups[c.mtrcol_index]
+            m.node_tree.links.new(ng.outputs['BSDF'], m.node_tree.nodes[0].inputs[0])
+            uv_idx = 0
+            for t in c.texture_info_table:
+                frame = m.node_tree.nodes.new('NodeFrame')
+                ti = m.node_tree.nodes.new('ShaderNodeTexImage')
+                ti.image = images[t.texture_buffer_index]
+                ti.parent = frame
+                uv = m.node_tree.nodes.new('ShaderNodeUVMap')
+                uv_map = uvnames[uv_idx]
+                uv_idx += 1
+                uv.uv_map = uv_map
+                uv.parent = frame
+                m.node_tree.links.new(uv.outputs['UV'], ti.inputs['Vector'])
+                match t.usage:
+                    case TextureUsage.Albedo:
+                        frame.label = 'Albedo'
+                        if ng.inputs['A'].is_linked:
+                            m.node_tree.links.new(ti.outputs['Color'], ng.inputs['B'])
+                            m.node_tree.links.new(ti.outputs['Alpha'], ng.inputs['Factor'])
+                        else:
+                            m.node_tree.links.new(ti.outputs['Color'], ng.inputs['A'])
+                            m.node_tree.links.new(ti.outputs['Alpha'], ng.inputs['Alpha'])
+                    case TextureUsage.Normal:
+                        frame.label = 'Normal'
+                        ti.image.colorspace_settings.name = 'Non-Color'
+                        nml = m.node_tree.nodes.new('ShaderNodeNormalMap')
+                        nml.uv_map = uv_map
+                        nml.parent = frame
+                        curv = m.node_tree.nodes.new('ShaderNodeRGBCurve')
+                        curv_p = curv.mapping.curves[1].points
+                        curv_p[0].location = (0, 1)
+                        curv_p[1].location = (1, 0)
+                        curv.parent = frame
+                        m.node_tree.links.new(ti.outputs['Color'], curv.inputs['Color'])
+                        m.node_tree.links.new(curv.outputs['Color'], nml.inputs['Color'])
+                        m.node_tree.links.new(nml.outputs['Normal'], ng.inputs['Normal'])
+                    case TextureUsage.Specular:
+                        frame.label = 'Specular'
+                        m.node_tree.links.new(ti.outputs['Color'], ng.inputs['Specular Tint'])
+                    case TextureUsage.Emission:
+                        frame.label = 'Emission'
+                        uv.uv_map = ''
+                        m.node_tree.links.new(ti.outputs['Color'], ng.inputs['Emission Color'])
+                        m.node_tree.links.new(ti.outputs['Alpha'], ng.inputs['Emission Strength'])
+                    case x:
+                        raise ValueError(f'Not supported texture map usage: {repr(x)}')
 
     # We form a mesh below
     m = bpy.data.meshes.new(tmc_name)
@@ -176,14 +205,16 @@ def import_tmc11(context, tmc):
     uv1 = []
     uv2 = []
     uv3 = []
-    for ndo in tmc.nodelay.chunks:
+    for c in tmc.nodelay.chunks:
         try:
-            objgeo = tmc.mdlgeo.chunks[ndo.chunks[0].obj_index]
+            objgeo = tmc.mdlgeo.chunks[c.chunks[0].obj_index]
         except IndexError:
             continue
-        wgt = ndo.metadata.name.startswith(b'MOT')
-        gm = Matrix(tmc.glblmtx.chunks[ndo.metadata.node_index])
-        for decl_idx, c in enumerate(objgeo.sub_container.chunks):
+        nidx = c.metadata.node_index
+        wgt = c.metadata.name.startswith(b'MOT') or c.metadata.name.startswith(b'OPT') or c.metadata.name.startswith(b'WPB')
+        gm = tmc.glblmtx.chunks[nidx]
+        gm = Matrix((gm[0:4], gm[4:8], gm[8:12], gm[12:16]))
+        for declc_idx, c in enumerate(objgeo.sub_container.chunks):
             blend_weights.extend(c.vertex_count * ((0, 0, 0, 0), ))
             blend_indices.extend(c.vertex_count * ((0, 0, 0, 0), ))
             uv0.extend(c.vertex_count * (Vector((0,0)), ))
@@ -203,17 +234,17 @@ def import_tmc11(context, tmc):
                             case D3DDECLTYPE.FLOAT3:
                                 for _, o in VO:
                                     v = bm.verts.new(Vector(V[o:o+12].cast('f')) @ gm)
-                                    v[deform_layer][ndo.metadata.node_index] = wgt
+                                    v[deform_layer][nidx] = wgt
                                 bm.verts.ensure_lookup_table()
                                 for c in objgeo.chunks:
-                                    mtrcol_index = texmapinfo_to_matindex[c.texture_map_info]
-                                    if c.geodecl_index == decl_idx:
+                                    material_index = objchunk_to_matindex[objgeo.metadata.obj_index][c.chunk_index]
+                                    if c.geodecl_chunk_index == declc_idx:
                                         g, h = lambda x: x, reversed
                                         for i in range(c.first_index_index, c.first_index_index + c.index_count - 2):
                                             if I[i] != I[i+1] and I[i+1] != I[i+2] and I[i+2] != I[i]:
                                                 try:
                                                     f = bm.faces.new( bm.verts[i + n] for i in g(I[i:i+3]) )
-                                                    f.material_index = mtrcol_index
+                                                    f.material_index = material_index
                                                 except ValueError:
                                                     pass
                                             g, h = h, g
@@ -303,7 +334,6 @@ def import_tmc11(context, tmc):
     for v in bm.verts:
         v.normal = vertex_normals[v.index]        
 
-    #bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0000001)
     bm.to_mesh(mesh_obj.data)
     mesh_obj.data.normals_split_custom_set_from_vertices(tuple(v.normal for v in bm.verts))
 
@@ -344,15 +374,16 @@ class ImportTMC11(Operator, ImportHelper):
         options={'SKIP_SAVE', 'HIDDEN'}
     )
 
+    def _mmap_file(self, n):
+        with open(os.path.join(self.directory, self.files[n].name), 'rb') as f:
+            return mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+
     def execute(self, context):
-        if len(self.files) < 2:
+        if len(self.files) != 2:
             self.report({'ERROR'}, 'Select both a TMC file and a TMCL file')
             return {'CANCELLED'}
 
-        f0 = os.path.join(self.directory, self.files[0].name)
-        f1 = os.path.join(self.directory, self.files[1].name)
-        with (open(f0, 'rb') as f0, open(f1, 'rb') as f1):
-            m_f0 = mmap.mmap(f0.fileno(), 0, access=mmap.ACCESS_READ)
-            m_f1 = mmap.mmap(f1.fileno(), 0, access=mmap.ACCESS_READ)
-            tmc = TMCParser(m_f0, m_f1) if m_f0[:4] == b'TMC\x00' else TMCParser(context, m_f1, m_f0)
+        m0, m1 = self._mmap_file(0), self._mmap_file(1)
+        tmc = TMCParser(m0, m1) if m0[:8].startswith(b'TMC\0\0\0\0\0') else TMCParser(m1, m0)
+        with m0, m1, tmc:
             return import_tmc11(context, tmc)
